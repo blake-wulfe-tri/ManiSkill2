@@ -1,20 +1,46 @@
+"""Networks used as components in dynamics models.
+
+The functions / classes in this file are designed to be used
+as components of dynamics models, but are not themselves
+dynamics models. Classes should inherit nn.Module.
+"""
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from mani_skill2.dynamics.base import DynamicsModel
+
+def FiLM(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    """Performs Feature-wise Linear Modulation (FiLM).
+
+    See https://arxiv.org/abs/1709.07871
+
+    Args:
+        x: Tensor of shape (B, C, H, W).
+        gamma: Multiplicative factor. Shape of (B, C).
+        beta: Additive factor. Shape of (B, C).
+    """
+    return x * gamma[..., None, None] + beta[..., None, None]
 
 
-class UnetFiLMDynamicsModel(DynamicsModel):
-    def __init__(self, n_channels, cond_size, lr=5e-4):
+class UnetFiLM(nn.Module):
+    """U-net architecture that incorporates conditioning information through FiLM layers.
+
+    Implementation based on https://github.com/milesial/Pytorch-UNet/blob/master/unet/unet_parts.py
+    """
+
+    def __init__(self, n_channels: int, cond_size: int):
+        """
+        Args:
+            n_channels: Number of input channels (1 for heightmap).
+            cond_size: The size of the vector conditioned on using
+                FiLM layers. The size of the action vector typically.
+        """
         super().__init__()
 
         self.n_channels = n_channels
         self.cond_size = cond_size
         self.bilinear = True
-
-        def film(x, gamma, beta):
-            gamma = gamma[..., None, None]
-            beta = beta[..., None, None]
-            return x * gamma + beta
 
         def double_conv(in_channels, out_channels):
             return nn.Sequential(
@@ -45,7 +71,7 @@ class UnetFiLMDynamicsModel(DynamicsModel):
                 x = self.relu(x)
                 x = self.conv2(x)
                 x = self.bn2(x)
-                x = film(x, gamma, beta)
+                x = FiLM(x, gamma, beta)
                 x = self.relu(x)
                 return x
 
@@ -93,6 +119,7 @@ class UnetFiLMDynamicsModel(DynamicsModel):
                 x = torch.cat([x2, x1], dim=1)
                 return self.conv(x)
 
+        # TODO(blake.wulfe): Generalize this network size logic.
         self.inc = double_conv(self.n_channels, 64)
         self.down1 = DownFiLM(64, 128)
         self.down2 = DownFiLM(128, 256)
@@ -102,21 +129,30 @@ class UnetFiLMDynamicsModel(DynamicsModel):
         self.up2 = up(512, 128)
         self.up3 = up(256, 64)
         self.up4 = up(128, 64)
-        self.out = nn.Conv2d(64, 1, kernel_size=1)
+        self.out = nn.Conv2d(64, self.n_channels, kernel_size=1)
 
         n_film_parameters = (128 + 256 + 512 + 512) * 2
         self.film_generator = nn.Linear(self.cond_size, n_film_parameters)
         torch.nn.init.kaiming_uniform_(self.film_generator.weight)
         self.film_generator.bias.data.zero_()
 
-    def forward(self, obs, action):
-        film_parameters = self.film_generator(action)
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        film_parameters = self.film_generator(cond)
         (d1_g, d1_b, d2_g, d2_b, d3_g, d3_b, d4_g, d4_b) = film_parameters.split(
-            (128, 128, 256, 256, 512, 512, 512, 512),
+            (
+                128,
+                128,
+                256,
+                256,
+                512,
+                512,
+                512,
+                512,
+            ),
             dim=1,
         )
 
-        x1 = self.inc(obs)
+        x1 = self.inc(x)
         x2 = self.down1(x1, d1_g, d1_b)
         x3 = self.down2(x2, d2_g, d2_b)
         x4 = self.down3(x3, d3_g, d3_b)
